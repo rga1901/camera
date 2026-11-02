@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<meta name="theme-color" content="#111111">
+<title>Remote Kamera</title>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:#111;color:#fff;font-family:system-ui,-apple-system,Roboto,sans-serif}
+[hidden]{display:none!important}
+.screen{position:fixed;inset:0;display:flex;flex-direction:column}
+.center{align-items:center;justify-content:center;gap:16px;padding:24px;text-align:center}
+h1{margin:0;font-size:22px}
+p{margin:0;color:#aaa;font-size:14px;line-height:1.5}
+button{font:inherit;border:0;border-radius:14px;padding:14px 20px;background:#2a2a2a;color:#fff;font-weight:600}
+button.main{background:#e0a800;color:#111}
+button:active{opacity:.7}
+.big{width:100%;max-width:320px;padding:18px;font-size:17px}
+video{width:100%;flex:1;min-height:0;object-fit:contain;background:#000}
+.bar{display:flex;gap:10px;padding:12px;background:#111;align-items:center;justify-content:center;flex-wrap:wrap}
+.pill{position:absolute;top:10px;left:10px;background:#000a;padding:6px 12px;border-radius:99px;font-size:13px}
+.code{font-size:56px;font-weight:800;letter-spacing:10px;color:#e0a800;padding-left:10px}
+input{font:inherit;font-size:32px;text-align:center;letter-spacing:8px;width:100%;max-width:240px;padding:12px;border-radius:14px;border:2px solid #444;background:#1b1b1b;color:#fff}
+.wrap{position:relative;flex:1;min-height:0;display:flex}
+#count{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:140px;font-weight:800;text-shadow:0 0 20px #000;pointer-events:none}
+#flash{position:fixed;inset:0;background:#fff;opacity:0;pointer-events:none;transition:opacity .25s}
+#thumb{position:absolute;right:10px;bottom:10px;width:84px;border-radius:10px;border:2px solid #fff;display:block}
+.on{background:#e0a800!important;color:#111!important}
+.err{color:#ff7b7b}
+</style>
+</head>
+<body>
+
+<!-- HOME -->
+<div id="home" class="screen center">
+  <h1>📷 Remote Kamera</h1>
+  <p>Pilih fungsi hape ini.<br>Hape A = Kamera. Hape B = Remote.</p>
+  <button class="main big" onclick="modeCamera()">Jadi KAMERA (hape A)</button>
+  <button class="big" onclick="show('rem')">Jadi REMOTE (hape B)</button>
+</div>
+
+<!-- KAMERA (A) -->
+<div id="cam" class="screen" hidden>
+  <div class="wrap">
+    <video id="localVid" autoplay playsinline muted></video>
+    <div class="pill" id="camStatus">Menyiapkan...</div>
+  </div>
+  <div class="bar" style="flex-direction:column;gap:4px">
+    <p>Masukkan kode ini di hape B:</p>
+    <div class="code" id="code">----</div>
+    <p id="camMsg"></p>
+  </div>
+</div>
+
+<!-- REMOTE (B) -->
+<div id="rem" class="screen" hidden>
+  <div id="remConnect" class="screen center">
+    <h1>Remote</h1>
+    <p>Masukkan 4 angka dari layar hape A</p>
+    <input id="inp" inputmode="numeric" maxlength="4" placeholder="0000">
+    <button class="main big" onclick="connectRemote()">Sambungkan</button>
+    <p id="remMsg"></p>
+    <button onclick="location.reload()">Kembali</button>
+  </div>
+  <div id="remLive" class="screen" hidden>
+    <div class="wrap">
+      <video id="remVid" autoplay playsinline muted></video>
+      <div class="pill" id="remStatus">Menunggu video...</div>
+      <div id="count"></div>
+      <img id="thumb" hidden alt="">
+    </div>
+    <div class="bar">
+      <button id="btnTimer" onclick="toggleTimer()">⏱ Timer 3s: OFF</button>
+      <button id="btnMirror" class="on" onclick="toggleMirror()">🪞 Mirror: ON</button>
+      <button onclick="send({cmd:'switch'})">🔄 Ganti kamera</button>
+      <button class="main big" style="max-width:none" onclick="shoot()">📸 FOTO</button>
+    </div>
+  </div>
+</div>
+
+<div id="flash"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const PREFIX = 'remotekamera-';
+let peer, stream, conn, mediaCall, facing = 'environment', wake;
+let timerOn = false, mirrorOn = true, lastThumb;
+
+function show(id){ ['home','cam','rem'].forEach(x => $(x).hidden = (x !== id)); }
+
+/* ============ HAPE A : KAMERA ============ */
+async function startStream(){
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: facing }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+    audio: false
+  });
+  $('localVid').srcObject = stream;
+  // kalau lagi tersambung, ganti track video yang dikirim ke B
+  if (mediaCall && mediaCall.peerConnection){
+    const sender = mediaCall.peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
+    if (sender) sender.replaceTrack(stream.getVideoTracks()[0]);
+  }
+}
+
+async function modeCamera(){
+  show('cam');
+  try { await startStream(); }
+  catch(e){ $('camMsg').innerHTML = '<span class="err">Kamera gagal dibuka: ' + e.message + '<br>Cek izin kamera.</span>'; return; }
+  try { wake = await navigator.wakeLock.request('screen'); } catch(e){}
+  makeCamPeer();
+}
+
+function makeCamPeer(){
+  if (peer) try { peer.destroy(); } catch(e){}
+  const code = String(Math.floor(1000 + Math.random() * 9000));
+  peer = new Peer(PREFIX + code);
+  peer.on('open', () => { $('code').textContent = code; $('camStatus').textContent = 'Menunggu hape B...'; });
+  peer.on('error', e => {
+    if (e.type === 'unavailable-id') makeCamPeer();
+    else $('camMsg').innerHTML = '<span class="err">Error: ' + e.type + '</span>';
+  });
+  peer.on('disconnected', () => { try { peer.reconnect(); } catch(e){} });
+  peer.on('connection', c => {
+    conn = c;
+    c.on('open', () => {
+      mediaCall = peer.call(c.peer, stream);
+      $('camStatus').textContent = '✅ Terhubung ke hape B';
+    });
+    c.on('data', onCommand);
+    c.on('close', () => { $('camStatus').textContent = 'Terputus, menunggu lagi...'; });
+  });
+}
+
+async function onCommand(d){
+  if (d.cmd === 'photo') await takePhoto();
+  if (d.cmd === 'switch'){
+    facing = (facing === 'environment') ? 'user' : 'environment';
+    try { await startStream(); } catch(e){ $('camMsg').textContent = 'Gagal ganti kamera'; }
+  }
+}
+
+async function takePhoto(){
+  let blob = null;
+  try {
+    const track = stream.getVideoTracks()[0];
+    if (window.ImageCapture) blob = await new ImageCapture(track).takePhoto();
+  } catch(e){ blob = null; }
+  if (!blob){
+    const v = $('localVid');
+    const c = document.createElement('canvas');
+    c.width = v.videoWidth; c.height = v.videoHeight;
+    c.getContext('2d').drawImage(v, 0, 0);
+    blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.92));
+  }
+  // efek kedip
+  $('flash').style.opacity = 1; setTimeout(() => $('flash').style.opacity = 0, 150);
+  // simpan di hape A
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'foto-' + Date.now() + '.jpg';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  // kirim juga ke hape B (cadangan kalau download di A tidak jalan)
+  if (conn && conn.open){
+    const buf = await blob.arrayBuffer();
+    conn.send({ type: 'photo', buf: buf });
+  }
+}
+
+/* ============ HAPE B : REMOTE ============ */
+function connectRemote(){
+  const code = $('inp').value.trim();
+  if (code.length !== 4){ $('remMsg').innerHTML = '<span class="err">Isi 4 angka</span>'; return; }
+  $('remMsg').textContent = 'Menyambung...';
+  if (peer) try { peer.destroy(); } catch(e){}
+  peer = new Peer();
+  peer.on('open', () => {
+    conn = peer.connect(PREFIX + code, { reliable: true });
+    conn.on('open', () => {
+      $('remConnect').hidden = true;
+      $('remLive').hidden = false;
+      applyMirror();
+    });
+    conn.on('data', onRemoteData);
+    conn.on('close', () => { $('remStatus').textContent = 'Terputus dari hape A'; });
+  });
+  peer.on('call', call => {
+    call.answer();
+    call.on('stream', s => {
+      const v = $('remVid');
+      v.srcObject = s;
+      v.play().catch(() => {});
+      $('remStatus').textContent = '✅ Live';
+    });
+  });
+  peer.on('error', e => {
+    $('remMsg').innerHTML = '<span class="err">' + (e.type === 'peer-unavailable' ? 'Kode tidak ditemukan. Cek hape A sudah menyala.' : 'Error: ' + e.type) + '</span>';
+  });
+}
+
+function send(o){ if (conn && conn.open) conn.send(o); }
+
+function onRemoteData(d){
+  if (d.type === 'photo'){
+    const blob = new Blob([d.buf], { type: 'image/jpeg' });
+    if (lastThumb) URL.revokeObjectURL(lastThumb);
+    lastThumb = URL.createObjectURL(blob);
+    const t = $('thumb'); t.src = lastThumb; t.hidden = false;
+    t.onclick = () => {
+      const a = document.createElement('a');
+      a.href = lastThumb; a.download = 'foto-' + Date.now() + '.jpg';
+      document.body.appendChild(a); a.click(); a.remove();
+    };
+  }
+}
+
+function toggleTimer(){
+  timerOn = !timerOn;
+  $('btnTimer').textContent = '⏱ Timer 3s: ' + (timerOn ? 'ON' : 'OFF');
+  $('btnTimer').classList.toggle('on', timerOn);
+}
+function toggleMirror(){
+  mirrorOn = !mirrorOn;
+  applyMirror();
+}
+function applyMirror(){
+  $('remVid').style.transform = mirrorOn ? 'scaleX(-1)' : 'none';
+  $('btnMirror').textContent = '🪞 Mirror: ' + (mirrorOn ? 'ON' : 'OFF');
+  $('btnMirror').classList.toggle('on', mirrorOn);
+}
+function shoot(){
+  if (!timerOn){ send({ cmd: 'photo' }); return; }
+  let n = 3;
+  $('count').textContent = n;
+  const iv = setInterval(() => {
+    n--;
+    if (n <= 0){ clearInterval(iv); $('count').textContent = ''; send({ cmd: 'photo' }); }
+    else $('count').textContent = n;
+  }, 1000);
+}
+</script>
+</body>
+</html>
